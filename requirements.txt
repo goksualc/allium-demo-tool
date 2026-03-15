@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+streamlit
+python-dateutil
+web3
+requests
