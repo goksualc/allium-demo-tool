@@ -78,15 +78,16 @@ def _alchemy_get_asset_transfers(
     from_block: int,
     to_block: int,
     category: List[str],
-    max_count: int = 100,
+    max_count: int = 1000,
     contract_addresses: Optional[List[str]] = None,
     order: str = "desc",
-) -> List[Dict[str, Any]]:
-    """Call Alchemy Transfers API; returns list of transfer objects."""
+    page_key: Optional[str] = None,
+) -> tuple[List[Dict[str, Any]], Optional[str]]:
+    """Call Alchemy Transfers API; returns (transfers, next_page_key)."""
     url = get_alchemy_url()
     params: Dict[str, Any] = {
         "fromBlock": hex(from_block),
-        "toBlock": hex(to_block),
+        "toBlock": "latest",  # include up to latest block (more reliable than hex(to_block))
         "category": category,
         "excludeZeroValue": True,
         "withMetadata": True,
@@ -94,7 +95,10 @@ def _alchemy_get_asset_transfers(
         "order": order,
     }
     if contract_addresses:
-        params["contractAddresses"] = [a.lower() for a in contract_addresses]
+        # Alchemy expects contract addresses as-is (checksum or lowercase both work)
+        params["contractAddresses"] = list(contract_addresses)
+    if page_key:
+        params["pageKey"] = page_key
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -107,7 +111,79 @@ def _alchemy_get_asset_transfers(
     if "error" in data:
         raise RuntimeError(data["error"].get("message", str(data["error"])))
     result = data.get("result") or {}
-    return result.get("transfers") or []
+    transfers = result.get("transfers") or []
+    next_key = result.get("pageKey") or None
+    if next_key and isinstance(next_key, str) and next_key.strip() == "":
+        next_key = None
+    return transfers, next_key
+
+
+# Known decimals for tokens (Alchemy sometimes omits rawContract.decimal)
+TOKEN_DECIMALS: Dict[str, int] = {
+    "USDC": 6,
+    "USDT": 6,
+    "DAI": 18,
+    "WETH": 18,
+}
+
+
+def _transfer_value(t: Dict[str, Any], token_symbol: Optional[str] = None) -> float:
+    """Extract human-readable amount. For USDC/USDT always use 6 decimals (raw/1e6)."""
+    token_upper = (token_symbol or t.get("asset") or "").upper()
+    is_stablecoin_6 = token_upper in ("USDC", "USDT")
+
+    raw = t.get("rawContract") or {}
+    raw_val = raw.get("value")
+    if raw_val is not None:
+        if isinstance(raw_val, str) and raw_val.startswith("0x"):
+            raw_int = int(raw_val, 16)
+        else:
+            try:
+                raw_int = int(raw_val)
+            except (TypeError, ValueError):
+                raw_int = 0
+        # USDC/USDT always have 6 decimals on-chain - never trust API decimal for these
+        if is_stablecoin_6:
+            decimals = 6
+        else:
+            decimals = TOKEN_DECIMALS.get(token_upper, 18)
+            decimals_raw = raw.get("decimal")
+            if decimals_raw is not None:
+                if isinstance(decimals_raw, str) and decimals_raw.startswith("0x"):
+                    decimals = int(decimals_raw, 16)
+                else:
+                    try:
+                        decimals = int(decimals_raw)
+                    except (TypeError, ValueError):
+                        pass
+        return raw_int / (10**decimals)
+
+    # Fallback: top-level "value" - for USDC/USDT it is often RAW (integer), so divide by 10^6
+    v = t.get("value")
+    if v is not None and isinstance(v, (int, float)):
+        v = float(v)
+        if is_stablecoin_6:
+            # If value looks like raw (integer or >= 1), treat as raw and divide by 10^6
+            if v >= 1.0 or (isinstance(t.get("value"), int)):
+                return v / 1_000_000
+            # Else assume already human (e.g. 8.68)
+            return v
+        return v
+    return 0.0
+
+
+def _normalize_address(addr: Any) -> str:
+    """Ensure 0x-prefixed full 40-char hex address for display."""
+    if addr is None:
+        return ""
+    s = str(addr).strip()
+    if s.startswith("0x") or s.startswith("0X"):
+        s = s[2:]
+    if len(s) > 40:
+        s = s[:40]
+    elif len(s) < 40:
+        s = s.zfill(40)
+    return "0x" + s.lower()
 
 
 def fetch_transfers_for_intent(
@@ -149,36 +225,92 @@ def fetch_transfers_for_intent(
             if addr:
                 contract_addresses = [addr]
 
+    def _is_requested_token(t: Dict[str, Any]) -> bool:
+        if not contract_addresses or not token:
+            return True
+        allowed_addrs = {a.lower() for a in contract_addresses}
+        token_upper = token.upper()
+        addr = (t.get("rawContract") or {}).get("address") or ""
+        if addr and addr.lower() in allowed_addrs:
+            return True
+        return (t.get("asset") or "").upper() == token_upper
+
+    def _transfer_key(t: Dict[str, Any]) -> tuple:
+        return (t.get("hash"), t.get("from"), t.get("to"), _transfer_value(t, token))
+
+    # Paginate until we have at least `limit` unique transfers for the requested token (or run out of pages)
+    all_raw: List[Dict[str, Any]] = []
+    page_key: Optional[str] = None
+    max_pages = 15
+    page_size = 1000
     try:
-        raw = _alchemy_get_asset_transfers(
-            from_block=from_block,
-            to_block=to_block,
-            category=category,
-            max_count=max(limit * 3, 50),  # fetch extra then sort by value
-            contract_addresses=contract_addresses,
-            order="desc",
-        )
+        for _ in range(max_pages):
+            transfers_batch, page_key = _alchemy_get_asset_transfers(
+                from_block=from_block,
+                to_block=to_block,
+                category=category,
+                max_count=page_size,
+                contract_addresses=contract_addresses,
+                order="desc",
+                page_key=page_key,
+            )
+            all_raw.extend(transfers_batch)
+            # After each page: filter to token, dedupe, and check if we have enough
+            filtered = [t for t in all_raw if _is_requested_token(t)]
+            seen: set = set()
+            unique_raw: List[Dict[str, Any]] = []
+            for t in filtered:
+                k = _transfer_key(t)
+                if k in seen:
+                    continue
+                seen.add(k)
+                unique_raw.append(t)
+            if len(unique_raw) >= limit:
+                break
+            if not page_key or len(transfers_batch) < page_size:
+                break
     except Exception as e:
         return {"ok": False, "error": str(e), "transfers": []}
 
-    # Normalize and sort by value desc, then take top `limit`
-    def _value(t: Dict[str, Any]) -> float:
-        v = t.get("value")
-        return float(v) if v is not None else 0.0
+    # Final filter and dedupe (in case we didn't do it in loop for last batch)
+    all_raw = [t for t in all_raw if _is_requested_token(t)]
+    seen = set()
+    unique_raw = []
+    for t in all_raw:
+        k = _transfer_key(t)
+        if k in seen:
+            continue
+        seen.add(k)
+        unique_raw.append(t)
 
-    sorted_transfers = sorted(raw, key=_value, reverse=True)[:limit]
+    # Sort by value (desc) and take top `limit`
+    sorted_transfers = sorted(unique_raw, key=lambda t: _transfer_value(t, token), reverse=True)[:limit]
+
+    token_display = (token or "ETH").upper()
+    decimals_round = 6 if token_display in ("USDC", "USDT") else 4
 
     rows: List[Dict[str, Any]] = []
     for t in sorted_transfers:
         meta = t.get("metadata") or {}
+        block_num = t.get("blockNum")
+        if isinstance(block_num, str) and block_num.startswith("0x"):
+            block_number = int(block_num, 16)
+        else:
+            block_number = block_num if isinstance(block_num, int) else 0
+        amount = _transfer_value(t, token)
+        h = t.get("hash")
+        if isinstance(h, str) and not h.startswith("0x"):
+            h = "0x" + h
+        if isinstance(h, str):
+            h = h.lower()
         rows.append({
             "block_time": meta.get("blockTimestamp"),
-            "block_number": int(t.get("blockNum", "0x0"), 16) if isinstance(t.get("blockNum"), str) else t.get("blockNum"),
-            "tx_hash": t.get("hash"),
-            "from_address": t.get("from"),
-            "to_address": t.get("to"),
-            "amount": t.get("value"),
-            "token_symbol": t.get("asset") or (token or "ETH"),
+            "block_number": block_number,
+            "tx_hash": h or "",
+            "from_address": _normalize_address(t.get("from")),
+            "to_address": _normalize_address(t.get("to")),
+            "amount": round(amount, decimals_round),
+            "token_symbol": token_display,
         })
     return {"ok": True, "transfers": rows, "chain": "ethereum"}
 
