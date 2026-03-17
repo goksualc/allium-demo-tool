@@ -18,6 +18,11 @@ Examples of questions:
 - "show me the top 5 USDC transfers on ethereum in the last 7 days"
 - "largest ETH transfers on base in the last 24 hours"
 
+**What you can ask (quick reference):**
+
+- **Token transfers:** Include the **chain** (e.g. *on Ethereum*, *on Solana*), **token** (USDC, ETH, etc.), **timeframe** (*last 24 hours*, *last 7 days*), and **limit** (*top 10*, *top 5*). Example: *Show top 10 USDC transfers on Ethereum in the last 24 hours*.
+- **Search by address or transaction (Ethereum only):** In the dashboard, paste an Ethereum address or transaction hash and click Run Query to see balance/tx count or tx details (from, to, value, status).
+
 AskChain:
 
 1. **Understands your question** (chain, token, timeframe, etc.).

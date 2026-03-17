@@ -4,7 +4,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from .parser import parse_prompt
 from .schemas import QueryRequest, QueryResponse
 from .sql_builder import build_sql
-from .alchemy_client import get_latest_block_summary, fetch_transfers_for_intent
+from .alchemy_client import (
+    get_latest_block_summary,
+    fetch_transfers_for_intent,
+    get_transaction_details,
+    get_address_details,
+)
 
 
 app = FastAPI(
@@ -65,4 +70,20 @@ def latest_block() -> dict:
     from Alchemy using your configured API key/URL.
     """
     return get_latest_block_summary()
+
+
+@app.get("/eth/tx/{tx_hash}")
+def tx_details(tx_hash: str) -> dict:
+    """
+    Fetch transaction details by hash for in-app explorer view.
+    """
+    return get_transaction_details(tx_hash)
+
+
+@app.get("/eth/address/{address}")
+def address_details(address: str) -> dict:
+    """
+    Fetch address details (balance, is_contract, tx count) for in-app explorer view.
+    """
+    return get_address_details(address)
 

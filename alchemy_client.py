@@ -193,17 +193,21 @@ def fetch_transfers_for_intent(
     limit: Optional[int],
 ) -> Dict[str, Any]:
     """
-    Fetch real on-chain transfer data from Alchemy based on parsed intent.
+    Fetch real on-chain transfer data based on parsed intent.
 
-    Only Ethereum is supported (Alchemy Transfers API on mainnet).
-    Returns { "ok": True, "transfers": [...], "chain": "ethereum" } or
-    { "ok": False, "error": "..." }.
+    Ethereum: Alchemy Transfers API. Solana: Alchemy Solana RPC.
+    Returns { "ok": True, "transfers": [...], "chain": "ethereum"|"solana" } or
+    { "ok": False, "error": "...", "transfers": [] }.
     """
     limit = limit or 10
-    if chain and chain != "ethereum":
+    chain_lower = (chain or "ethereum").strip().lower()
+    if chain_lower in ("solana", "sol"):
+        from .solana_client import fetch_transfers_solana
+        return fetch_transfers_solana(token, timeframe, limit)
+    if chain_lower not in ("ethereum", "eth"):
         return {
             "ok": False,
-            "error": f"Real on-chain data is only available for Ethereum in this demo (requested: {chain}).",
+            "error": f"Unsupported chain: {chain}. Use Ethereum or Solana.",
             "transfers": [],
         }
     try:
@@ -313,4 +317,81 @@ def fetch_transfers_for_intent(
             "token_symbol": token_display,
         })
     return {"ok": True, "transfers": rows, "chain": "ethereum"}
+
+
+def _normalize_tx_hash(tx_hash: str) -> str:
+    h = (tx_hash or "").strip()
+    if not h.startswith("0x"):
+        h = "0x" + h
+    return h.lower()
+
+
+def get_transaction_details(tx_hash: str) -> Dict[str, Any]:
+    """
+    Fetch transaction and receipt from chain; return a detail payload for the explorer UI.
+    """
+    w3 = get_web3()
+    h = _normalize_tx_hash(tx_hash)
+    tx = w3.eth.get_transaction(h)
+    if tx is None:
+        return {"error": "Transaction not found", "tx_hash": h}
+    receipt = w3.eth.get_transaction_receipt(h)
+    block = w3.eth.get_block(tx["blockNumber"]) if tx.get("blockNumber") else None
+    block_ts = block["timestamp"] if block else None
+
+    def wei_to_eth(wei_val: Any) -> str:
+        if wei_val is None:
+            return "0"
+        if isinstance(wei_val, str) and wei_val.startswith("0x"):
+            wei_val = int(wei_val, 16)
+        if hasattr(wei_val, "hex"):
+            wei_val = int(wei_val.hex(), 16)
+        return str(wei_val / 1e18) if wei_val else "0"
+
+    def to_int(v: Any) -> Optional[int]:
+        if v is None:
+            return None
+        if isinstance(v, int):
+            return v
+        if isinstance(v, str) and v.startswith("0x"):
+            return int(v, 16)
+        if hasattr(v, "hex"):
+            return int(v.hex(), 16)
+        return None
+
+    status = "Success" if (receipt and receipt.get("status") == 1) else "Failed"
+    return {
+        "tx_hash": tx["hash"].hex() if hasattr(tx["hash"], "hex") else str(tx["hash"]),
+        "status": status,
+        "block_number": tx.get("blockNumber"),
+        "timestamp": int(block_ts) if block_ts is not None else None,
+        "from": _normalize_address(tx.get("from")),
+        "to": _normalize_address(tx.get("to")) if tx.get("to") else None,
+        "value_eth": wei_to_eth(tx.get("value")),
+        "gas_used": to_int(receipt.get("gasUsed")) if receipt else None,
+        "gas_limit": to_int(tx.get("gas")),
+        "method": "transfer" if (tx.get("input") == "0x" or (tx.get("input") and len(tx.get("input", "")) <= 10)) else "contract",
+    }
+
+
+def get_address_details(address: str) -> Dict[str, Any]:
+    """
+    Fetch address balance, contract flag, and transaction count for explorer UI.
+    """
+    w3 = get_web3()
+    addr = _normalize_address(address) or address
+    if not addr or len(addr) < 42:
+        return {"error": "Invalid address", "address": address}
+    balance_wei = w3.eth.get_balance(addr)
+    code = w3.eth.get_code(addr)
+    is_contract = bool(code and code != b"\x00" and code != "0x" and code != "0x0")
+    tx_count = w3.eth.get_transaction_count(addr)
+    balance_eth = balance_wei / 1e18
+    return {
+        "address": addr,
+        "balance_eth": str(balance_eth),
+        "balance_wei": str(balance_wei),
+        "is_contract": is_contract,
+        "transaction_count": tx_count,
+    }
 
